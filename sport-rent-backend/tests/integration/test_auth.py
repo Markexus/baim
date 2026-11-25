@@ -1,0 +1,1005 @@
+import asyncio
+import datetime
+import time
+from http.cookies import SimpleCookie
+from urllib.parse import parse_qs, urlsplit
+
+import jwt
+import pytest
+from fastapi import FastAPI
+from httpx import ASGITransport, AsyncClient, Response
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from app.core.config import settings
+from app.core.password_reset import hash_password_reset_token
+from app.core.passwords import verify_password
+from app.core.tokens import decode_access_token, decode_refresh_token
+from app.models import (
+    Address,
+    AuthSession,
+    LoyaltyTransaction,
+    LoyaltyTransactionType,
+    PasswordResetToken,
+    User,
+)
+from app.services.loyalty import calculate_points_expiration
+from tests.support import SeededUser
+
+REFRESH_COOKIE_NAME = "refresh_token"
+CSRF_COOKIE_NAME = "csrf_token"
+CSRF_HEADER_NAME = "X-CSRF-Token"
+
+
+def refresh_token_from(response: Response) -> str:
+    token = response.cookies.get(REFRESH_COOKIE_NAME)
+    assert token
+    return token
+
+
+def cookie_from(response: Response, name: str):
+    cookie = SimpleCookie()
+    for value in response.headers.get_list("set-cookie"):
+        cookie.load(value)
+    return cookie[name]
+
+
+def refresh_cookie_from(response: Response):
+    return cookie_from(response, REFRESH_COOKIE_NAME)
+
+
+def csrf_token_from(response: Response) -> str:
+    token = response.cookies.get(CSRF_COOKIE_NAME)
+    assert token
+    return token
+
+
+def csrf_headers(
+    csrf_token: str,
+    *,
+    refresh_token: str | None = None,
+) -> dict[str, str]:
+    cookies = [f"{CSRF_COOKIE_NAME}={csrf_token}"]
+    if refresh_token is not None:
+        cookies.append(f"{REFRESH_COOKIE_NAME}={refresh_token}")
+
+    return {
+        "Cookie": "; ".join(cookies),
+        CSRF_HEADER_NAME: csrf_token,
+    }
+
+
+def password_reset_token_from_output(output: str, *, email: str) -> str:
+    prefix = f"Password reset link for {email}: "
+    assert output.startswith(prefix)
+
+    reset_url = output.removeprefix(prefix)
+    parsed_url = urlsplit(reset_url)
+
+    assert f"{parsed_url.scheme}://{parsed_url.netloc}" == settings.frontend_url
+    assert parsed_url.path == "/reset-password/confirm"
+    assert parsed_url.query == ""
+
+    token = parse_qs(parsed_url.fragment).get("token")
+    assert token is not None
+    assert len(token) == 1
+
+    return token[0]
+
+
+def assert_refresh_cookie_deleted(response: Response) -> None:
+    cookie = refresh_cookie_from(response)
+
+    assert cookie.value == ""
+    assert cookie["max-age"] == "0"
+    assert cookie["expires"]
+    assert cookie["path"] == "/auth"
+    assert cookie["httponly"]
+    assert cookie["samesite"].casefold() == "lax"
+    assert bool(cookie["secure"]) is settings.auth_cookie_secure
+
+
+def assert_csrf_cookie_deleted(response: Response) -> None:
+    cookie = cookie_from(response, CSRF_COOKIE_NAME)
+
+    assert cookie.value == ""
+    assert cookie["max-age"] == "0"
+    assert cookie["expires"]
+    assert cookie["path"] == "/"
+    assert not cookie["httponly"]
+    assert cookie["samesite"].casefold() == "lax"
+    assert bool(cookie["secure"]) is settings.auth_cookie_secure
+
+
+async def login(client: AsyncClient, user: SeededUser) -> Response:
+    return await client.post(
+        "/auth/login",
+        json={"email": user.email, "password": user.password},
+    )
+
+
+def registration_payload(
+    *,
+    email: str = "new.user@example.com",
+    password: str = "Secure-password-123!",
+) -> dict[str, object]:
+    return {
+        "email": email,
+        "password": password,
+        "first_name": "Jan",
+        "last_name": "Nowak",
+        "address": {
+            "first_line": "ul. Testowa 10",
+            "second_line": "lok. 2",
+            "postal_code": "00-001",
+            "city": "Warszawa",
+            "country": "Polska",
+        },
+    }
+
+
+async def test_register_creates_user_with_normalized_email_and_hashed_password(
+    client: AsyncClient,
+    empty_auth_database: None,
+    test_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    response = await client.post(
+        "/auth/register",
+        json=registration_payload(email="  NEW.User@Example.COM  "),
+    )
+
+    assert response.status_code == 201
+    assert response.json()["email"] == "new.user@example.com"
+    assert set(response.json()) == {"id", "email"}
+
+    async with test_session_factory() as session:
+        result = await session.execute(
+            select(User, Address)
+            .join(Address, User.default_address_id == Address.id)
+            .where(User.email == "new.user@example.com")
+        )
+        row = result.one_or_none()
+        registration_bonus = await session.scalar(
+            select(LoyaltyTransaction).where(
+                LoyaltyTransaction.user_id == response.json()["id"]
+            )
+        )
+
+    assert row is not None
+    user, address = row
+    assert user.id == response.json()["id"]
+    assert user.password_hash != "Secure-password-123!"
+    assert verify_password("Secure-password-123!", user.password_hash)
+    assert user.first_name == "Jan"
+    assert user.last_name == "Nowak"
+    assert address.first_name is None
+    assert address.last_name is None
+    assert address.first_line == "ul. Testowa 10"
+    assert address.second_line == "lok. 2"
+    assert address.postal_code == "00-001"
+    assert address.city == "Warszawa"
+    assert address.country == "Polska"
+    assert address.company is None
+    assert address.nip is None
+    assert registration_bonus is not None
+    assert registration_bonus.order_id is None
+    assert registration_bonus.type is LoyaltyTransactionType.EARN
+    assert registration_bonus.amount == 10
+    assert registration_bonus.description == "Registration bonus"
+    assert registration_bonus.expires_at == calculate_points_expiration(
+        registration_bonus.created_at
+    )
+
+
+async def test_register_rejects_existing_normalized_email(
+    client: AsyncClient,
+    empty_auth_database: None,
+    test_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    email = "existing.user@example.com"
+    first_response = await client.post(
+        "/auth/register",
+        json=registration_payload(email=email),
+    )
+    assert first_response.status_code == 201
+
+    response = await client.post(
+        "/auth/register",
+        json=registration_payload(email=f"  {email.upper()}  "),
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Email is already registered"}
+
+    async with test_session_factory() as session:
+        user_count = await session.scalar(select(func.count()).select_from(User))
+        registration_bonus_count = await session.scalar(
+            select(func.count()).select_from(LoyaltyTransaction)
+        )
+
+    assert user_count == 1
+    assert registration_bonus_count == 1
+
+
+async def test_register_rejects_too_short_password(
+    client: AsyncClient,
+    empty_auth_database: None,
+) -> None:
+    response = await client.post(
+        "/auth/register",
+        json=registration_payload(password="short"),
+    )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize("field", ["first_name", "last_name"])
+async def test_register_requires_first_and_last_name(
+    client: AsyncClient,
+    empty_auth_database: None,
+    field: str,
+) -> None:
+    payload = registration_payload()
+    del payload[field]
+
+    response = await client.post("/auth/register", json=payload)
+
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize("field", ["company", "nip"])
+async def test_register_rejects_company_and_nip(
+    client: AsyncClient,
+    empty_auth_database: None,
+    field: str,
+) -> None:
+    payload = registration_payload()
+    address = payload["address"]
+    assert isinstance(address, dict)
+    address[field] = "not-allowed"
+
+    response = await client.post("/auth/register", json=payload)
+
+    assert response.status_code == 422
+
+
+async def test_login_returns_access_token_and_creates_session(
+    client: AsyncClient,
+    test_user: SeededUser,
+    test_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    response = await login(client, test_user)
+
+    assert response.status_code == 200
+    assert set(response.json()) == {"access_token", "token_type", "expires_in"}
+    assert response.json()["token_type"] == "bearer"
+    assert response.json()["expires_in"] == settings.jwt_access_expiration
+    assert "refresh_token" not in response.json()
+
+    cookie = refresh_cookie_from(response)
+    assert cookie.value
+    assert cookie["max-age"] == str(settings.jwt_refresh_expiration)
+    assert cookie["path"] == "/auth"
+    assert cookie["httponly"]
+    assert cookie["samesite"].casefold() == "lax"
+    assert bool(cookie["secure"]) is settings.auth_cookie_secure
+
+    csrf_cookie = cookie_from(response, CSRF_COOKIE_NAME)
+    assert csrf_cookie.value
+    assert csrf_cookie["max-age"] == str(settings.csrf_expiration)
+    assert csrf_cookie["path"] == "/"
+    assert not csrf_cookie["httponly"]
+    assert csrf_cookie["samesite"].casefold() == "lax"
+    assert bool(csrf_cookie["secure"]) is settings.auth_cookie_secure
+
+    access_claims = decode_access_token(response.json()["access_token"])
+    refresh_claims = decode_refresh_token(cookie.value)
+
+    assert access_claims.user_id == test_user.id
+    assert refresh_claims.user_id == test_user.id
+    assert access_claims.session_id == refresh_claims.session_id
+    assert access_claims.token_type == "access"
+    assert refresh_claims.token_type == "refresh"
+    assert access_claims.expires_at - access_claims.issued_at == datetime.timedelta(
+        seconds=settings.jwt_access_expiration
+    )
+    assert refresh_claims.expires_at - refresh_claims.issued_at == datetime.timedelta(
+        seconds=settings.jwt_refresh_expiration
+    )
+
+    async with test_session_factory() as session:
+        user = await session.get(User, test_user.id)
+        auth_session = await session.get(AuthSession, refresh_claims.session_id)
+
+    assert user is not None
+    assert user.last_login_at == refresh_claims.issued_at
+    assert auth_session is not None
+    assert auth_session.user_id == test_user.id
+    assert auth_session.current_jti == refresh_claims.token_id
+    assert auth_session.revoked_at is None
+
+
+@pytest.mark.parametrize(
+    ("email", "password"),
+    [
+        ("jan.kowalski@poczta.pl", "incorrect-password"),
+        ("unknown@example.com", "incorrect-password"),
+    ],
+)
+async def test_login_rejects_invalid_credentials_without_creating_session(
+    client: AsyncClient,
+    test_user: SeededUser,
+    test_session_factory: async_sessionmaker[AsyncSession],
+    email: str,
+    password: str,
+) -> None:
+    response = await client.post(
+        "/auth/login",
+        json={"email": email, "password": password},
+    )
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Incorrect email or password"}
+    assert "set-cookie" not in response.headers
+
+    async with test_session_factory() as session:
+        session_count = await session.scalar(
+            select(func.count()).select_from(AuthSession)
+        )
+        user = await session.get(User, test_user.id)
+
+    assert session_count == 0
+    assert user is not None
+    assert user.last_login_at is None
+
+
+async def test_password_reset_link_changes_password_and_revokes_sessions(
+    client: AsyncClient,
+    test_user: SeededUser,
+    test_session_factory: async_sessionmaker[AsyncSession],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    login_response = await login(client, test_user)
+    access_token = login_response.json()["access_token"]
+    refresh_claims = decode_refresh_token(refresh_token_from(login_response))
+
+    response = await client.post(
+        "/auth/reset-password",
+        json={"email": test_user.email},
+    )
+
+    assert response.status_code == 204
+    assert response.content == b""
+
+    output = capsys.readouterr().out.strip()
+    reset_token = password_reset_token_from_output(output, email=test_user.email)
+
+    async with test_session_factory() as session:
+        user = await session.get(User, test_user.id)
+        stored_token = await session.scalar(select(PasswordResetToken))
+
+    assert user is not None
+    assert verify_password(test_user.password, user.password_hash)
+    assert stored_token is not None
+    assert stored_token.token_hash == hash_password_reset_token(reset_token)
+    assert stored_token.token_hash != reset_token
+    assert stored_token.used_at is None
+    assert stored_token.expires_at > datetime.datetime.now(datetime.UTC)
+
+    validation_response = await client.post(
+        "/auth/reset-password/validate",
+        json={"token": reset_token},
+    )
+
+    assert validation_response.status_code == 200
+    assert validation_response.json() == {"email": test_user.email}
+    assert validation_response.headers["cache-control"] == "no-store"
+
+    new_password = "New-test-password-456!"
+    confirmation_response = await client.post(
+        "/auth/reset-password/confirm",
+        json={"token": reset_token, "new_password": new_password},
+    )
+
+    assert confirmation_response.status_code == 204
+    assert confirmation_response.content == b""
+    assert confirmation_response.headers["cache-control"] == "no-store"
+    assert_refresh_cookie_deleted(confirmation_response)
+    assert_csrf_cookie_deleted(confirmation_response)
+
+    async with test_session_factory() as session:
+        user = await session.get(User, test_user.id)
+        stored_token = await session.scalar(select(PasswordResetToken))
+        auth_session = await session.get(AuthSession, refresh_claims.session_id)
+
+    assert user is not None
+    assert verify_password(new_password, user.password_hash)
+    assert not verify_password(test_user.password, user.password_hash)
+    assert stored_token is not None
+    assert stored_token.used_at is not None
+    assert auth_session is not None
+    assert auth_session.revoked_at is not None
+
+    revoked_access_token_response = await client.get(
+        "/user",
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    assert revoked_access_token_response.status_code == 401
+    assert revoked_access_token_response.json() == {"detail": "Invalid token"}
+
+    reused_token_response = await client.post(
+        "/auth/reset-password/confirm",
+        json={"token": reset_token, "new_password": "Another-password-789!"},
+    )
+    assert reused_token_response.status_code == 400
+    assert reused_token_response.json() == {
+        "detail": "Invalid or expired password reset link"
+    }
+
+    old_password_response = await client.post(
+        "/auth/login",
+        json={"email": test_user.email, "password": test_user.password},
+    )
+    new_password_response = await client.post(
+        "/auth/login",
+        json={"email": test_user.email, "password": new_password},
+    )
+    assert old_password_response.status_code == 401
+    assert new_password_response.status_code == 200
+
+
+async def test_password_reset_for_unknown_email_is_neutral(
+    client: AsyncClient,
+    test_user: SeededUser,
+    test_session_factory: async_sessionmaker[AsyncSession],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    response = await client.post(
+        "/auth/reset-password",
+        json={"email": "unknown@example.com"},
+    )
+
+    assert response.status_code == 204
+    assert response.content == b""
+    assert capsys.readouterr().out == ""
+
+    async with test_session_factory() as session:
+        user = await session.get(User, test_user.id)
+        token_count = await session.scalar(
+            select(func.count()).select_from(PasswordResetToken)
+        )
+
+    assert user is not None
+    assert verify_password(test_user.password, user.password_hash)
+    assert token_count == 0
+
+
+async def test_new_password_reset_link_invalidates_previous_link(
+    client: AsyncClient,
+    test_user: SeededUser,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    await client.post(
+        "/auth/reset-password",
+        json={"email": test_user.email},
+    )
+    first_token = password_reset_token_from_output(
+        capsys.readouterr().out.strip(),
+        email=test_user.email,
+    )
+
+    await client.post(
+        "/auth/reset-password",
+        json={"email": test_user.email},
+    )
+    second_token = password_reset_token_from_output(
+        capsys.readouterr().out.strip(),
+        email=test_user.email,
+    )
+
+    assert first_token != second_token
+
+    first_validation = await client.post(
+        "/auth/reset-password/validate",
+        json={"token": first_token},
+    )
+    second_validation = await client.post(
+        "/auth/reset-password/validate",
+        json={"token": second_token},
+    )
+
+    assert first_validation.status_code == 400
+    assert second_validation.status_code == 200
+
+
+async def test_concurrent_password_reset_requests_leave_only_one_valid_link(
+    application: FastAPI,
+    test_user: SeededUser,
+    test_session_factory: async_sessionmaker[AsyncSession],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    transport = ASGITransport(app=application)
+
+    async with (
+        AsyncClient(
+            transport=transport,
+            base_url="https://testserver",
+        ) as first_client,
+        AsyncClient(
+            transport=transport,
+            base_url="https://testserver",
+        ) as second_client,
+    ):
+        responses = await asyncio.gather(
+            first_client.post(
+                "/auth/reset-password",
+                json={"email": test_user.email},
+            ),
+            second_client.post(
+                "/auth/reset-password",
+                json={"email": test_user.email},
+            ),
+        )
+
+        assert [response.status_code for response in responses] == [204, 204]
+
+        output_lines = capsys.readouterr().out.strip().splitlines()
+        assert len(output_lines) == 2
+        reset_tokens = [
+            password_reset_token_from_output(line, email=test_user.email)
+            for line in output_lines
+        ]
+
+        async with test_session_factory() as session:
+            stored_tokens = list(await session.scalars(select(PasswordResetToken)))
+
+        assert len(stored_tokens) == 1
+        assert stored_tokens[0].token_hash in {
+            hash_password_reset_token(token) for token in reset_tokens
+        }
+
+        validation_responses = await asyncio.gather(
+            *(
+                first_client.post(
+                    "/auth/reset-password/validate",
+                    json={"token": token},
+                )
+                for token in reset_tokens
+            )
+        )
+
+    assert sorted(response.status_code for response in validation_responses) == [
+        200,
+        400,
+    ]
+
+
+async def test_password_reset_is_rate_limited(
+    client: AsyncClient,
+    test_user: SeededUser,
+) -> None:
+    for _ in range(settings.password_reset_email_rate_limit):
+        response = await client.post(
+            "/auth/reset-password",
+            json={"email": test_user.email},
+        )
+        assert response.status_code == 204
+
+    blocked_response = await client.post(
+        "/auth/reset-password",
+        json={"email": test_user.email},
+    )
+
+    assert blocked_response.status_code == 429
+    assert blocked_response.json() == {"detail": "Too many password reset requests"}
+    assert int(blocked_response.headers["retry-after"]) >= 1
+
+
+async def test_password_reset_has_minimum_response_time_for_known_and_unknown_email(
+    client: AsyncClient,
+    test_user: SeededUser,
+) -> None:
+    minimum_duration = settings.password_reset_min_response_time_ms / 1000
+
+    for email in (test_user.email, "unknown@example.com"):
+        started_at = time.monotonic()
+        response = await client.post(
+            "/auth/reset-password",
+            json={"email": email},
+        )
+        duration = time.monotonic() - started_at
+
+        assert response.status_code == 204
+        assert duration >= minimum_duration - 0.02
+
+
+async def test_expired_password_reset_link_is_rejected(
+    client: AsyncClient,
+    test_user: SeededUser,
+    test_session_factory: async_sessionmaker[AsyncSession],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    await client.post(
+        "/auth/reset-password",
+        json={"email": test_user.email},
+    )
+    reset_token = password_reset_token_from_output(
+        capsys.readouterr().out.strip(),
+        email=test_user.email,
+    )
+
+    async with test_session_factory.begin() as session:
+        stored_token = await session.scalar(select(PasswordResetToken))
+        assert stored_token is not None
+        stored_token.expires_at = datetime.datetime.now(
+            datetime.UTC
+        ) - datetime.timedelta(seconds=1)
+
+    validation_response = await client.post(
+        "/auth/reset-password/validate",
+        json={"token": reset_token},
+    )
+    confirmation_response = await client.post(
+        "/auth/reset-password/confirm",
+        json={"token": reset_token, "new_password": "New-test-password-456!"},
+    )
+
+    assert validation_response.status_code == 400
+    assert confirmation_response.status_code == 400
+
+
+async def test_access_token_protects_endpoint_and_expired_token_is_rejected(
+    client: AsyncClient,
+    test_user: SeededUser,
+) -> None:
+    login_response = await login(client, test_user)
+    access_token = login_response.json()["access_token"]
+
+    response = await client.get(
+        "/user",
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["email"] == test_user.email
+
+    payload = jwt.decode(
+        access_token,
+        options={"verify_signature": False},
+    )
+    now = datetime.datetime.now(datetime.UTC)
+    payload["iat"] = int((now - datetime.timedelta(minutes=2)).timestamp())
+    payload["exp"] = int((now - datetime.timedelta(minutes=1)).timestamp())
+    expired_token = jwt.encode(
+        payload,
+        settings.jwt_access_secret,
+        algorithm="HS256",
+    )
+
+    expired_response = await client.get(
+        "/user",
+        headers={"Authorization": f"Bearer {expired_token}"},
+    )
+
+    assert expired_response.status_code == 401
+    assert expired_response.headers["www-authenticate"] == "Bearer"
+    assert expired_response.json() == {"detail": "Invalid token"}
+
+
+async def test_change_password_updates_password_hash(
+    client: AsyncClient,
+    test_user: SeededUser,
+    test_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    login_response = await login(client, test_user)
+    access_token = login_response.json()["access_token"]
+    new_password = "New-secure-password-456!"
+
+    response = await client.post(
+        "/auth/change-password",
+        headers={"Authorization": f"Bearer {access_token}"},
+        json={
+            "current_password": test_user.password,
+            "new_password": new_password,
+        },
+    )
+
+    assert response.status_code == 204
+    assert response.content == b""
+
+    async with test_session_factory() as session:
+        user = await session.get(User, test_user.id)
+
+    assert user is not None
+    assert user.password_hash != test_user.password
+    assert user.password_hash != new_password
+    assert not verify_password(test_user.password, user.password_hash)
+    assert verify_password(new_password, user.password_hash)
+
+
+async def test_change_password_rejects_incorrect_current_password(
+    client: AsyncClient,
+    test_user: SeededUser,
+    test_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    login_response = await login(client, test_user)
+    access_token = login_response.json()["access_token"]
+
+    response = await client.post(
+        "/auth/change-password",
+        headers={"Authorization": f"Bearer {access_token}"},
+        json={
+            "current_password": "Incorrect-password-123!",
+            "new_password": "New-secure-password-456!",
+        },
+    )
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Current password is incorrect"}
+
+    async with test_session_factory() as session:
+        user = await session.get(User, test_user.id)
+
+    assert user is not None
+    assert verify_password(test_user.password, user.password_hash)
+
+
+@pytest.mark.parametrize("new_password", ["short", "x" * 129])
+async def test_change_password_rejects_invalid_new_password_format(
+    client: AsyncClient,
+    test_user: SeededUser,
+    new_password: str,
+) -> None:
+    login_response = await login(client, test_user)
+    access_token = login_response.json()["access_token"]
+
+    response = await client.post(
+        "/auth/change-password",
+        headers={"Authorization": f"Bearer {access_token}"},
+        json={
+            "current_password": test_user.password,
+            "new_password": new_password,
+        },
+    )
+
+    assert response.status_code == 422
+
+
+async def test_change_password_requires_authentication(
+    client: AsyncClient,
+    test_user: SeededUser,
+) -> None:
+    response = await client.post(
+        "/auth/change-password",
+        json={
+            "current_password": test_user.password,
+            "new_password": "New-secure-password-456!",
+        },
+    )
+
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Bearer"
+
+
+@pytest.mark.parametrize("refresh_token", [None, "not-a-jwt"])
+async def test_refresh_rejects_invalid_cookie_and_deletes_it(
+    client: AsyncClient,
+    refresh_token: str | None,
+) -> None:
+    headers = csrf_headers("csrf-token", refresh_token=refresh_token)
+
+    response = await client.post("/auth/refresh", headers=headers)
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Could not validate refresh token"}
+    assert_refresh_cookie_deleted(response)
+
+
+async def test_refresh_rotates_token_and_updates_session(
+    client: AsyncClient,
+    test_user: SeededUser,
+    test_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    login_response = await login(client, test_user)
+    original_refresh_token = refresh_token_from(login_response)
+    original_claims = decode_refresh_token(original_refresh_token)
+    csrf_token = csrf_token_from(login_response)
+
+    response = await client.post(
+        "/auth/refresh",
+        headers={CSRF_HEADER_NAME: csrf_token},
+    )
+
+    assert response.status_code == 200
+    rotated_refresh_token = refresh_token_from(response)
+    rotated_claims = decode_refresh_token(rotated_refresh_token)
+    access_claims = decode_access_token(response.json()["access_token"])
+
+    assert rotated_refresh_token != original_refresh_token
+    assert rotated_claims.session_id == original_claims.session_id
+    assert rotated_claims.token_id != original_claims.token_id
+    assert access_claims.session_id == original_claims.session_id
+
+    async with test_session_factory() as session:
+        auth_session = await session.get(AuthSession, original_claims.session_id)
+
+    assert auth_session is not None
+    assert auth_session.current_jti == rotated_claims.token_id
+    assert auth_session.previous_jti == original_claims.token_id
+    assert auth_session.previous_valid_until is not None
+    assert auth_session.revoked_at is None
+
+
+async def test_parallel_refresh_returns_same_rotated_token(
+    application: FastAPI,
+    client: AsyncClient,
+    test_user: SeededUser,
+) -> None:
+    login_response = await login(client, test_user)
+    original_refresh_token = refresh_token_from(login_response)
+    csrf_token = csrf_token_from(login_response)
+
+    async def refresh() -> Response:
+        async with AsyncClient(
+            transport=ASGITransport(app=application),
+            base_url="https://testserver",
+        ) as refresh_client:
+            return await refresh_client.post(
+                "/auth/refresh",
+                headers=csrf_headers(
+                    csrf_token,
+                    refresh_token=original_refresh_token,
+                ),
+            )
+
+    first_response, second_response = await asyncio.gather(refresh(), refresh())
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    assert refresh_token_from(first_response) == refresh_token_from(second_response)
+
+
+async def test_reusing_old_refresh_token_revokes_session(
+    application: FastAPI,
+    client: AsyncClient,
+    test_user: SeededUser,
+    test_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    login_response = await login(client, test_user)
+    original_refresh_token = refresh_token_from(login_response)
+    original_claims = decode_refresh_token(original_refresh_token)
+    csrf_token = csrf_token_from(login_response)
+
+    refresh_response = await client.post(
+        "/auth/refresh",
+        headers={CSRF_HEADER_NAME: csrf_token},
+    )
+    current_refresh_token = refresh_token_from(refresh_response)
+
+    async with test_session_factory.begin() as session:
+        auth_session = await session.get(AuthSession, original_claims.session_id)
+        assert auth_session is not None
+        auth_session.previous_valid_until = datetime.datetime.now(
+            datetime.UTC
+        ) - datetime.timedelta(seconds=1)
+
+    async with AsyncClient(
+        transport=ASGITransport(app=application),
+        base_url="https://testserver",
+    ) as reuse_client:
+        reuse_response = await reuse_client.post(
+            "/auth/refresh",
+            headers=csrf_headers(
+                csrf_token,
+                refresh_token=original_refresh_token,
+            ),
+        )
+        current_response = await reuse_client.post(
+            "/auth/refresh",
+            headers=csrf_headers(
+                csrf_token,
+                refresh_token=current_refresh_token,
+            ),
+        )
+
+    assert reuse_response.status_code == 401
+    assert_refresh_cookie_deleted(reuse_response)
+    assert current_response.status_code == 401
+    assert_refresh_cookie_deleted(current_response)
+
+    async with test_session_factory() as session:
+        auth_session = await session.get(AuthSession, original_claims.session_id)
+
+    assert auth_session is not None
+    assert auth_session.revoked_at is not None
+
+
+@pytest.mark.parametrize("refresh_token", [None, "not-a-jwt"])
+async def test_logout_is_idempotent_without_valid_cookie(
+    client: AsyncClient,
+    refresh_token: str | None,
+) -> None:
+    headers = csrf_headers("csrf-token", refresh_token=refresh_token)
+
+    response = await client.post("/auth/logout", headers=headers)
+
+    assert response.status_code == 204
+    assert response.content == b""
+    assert_refresh_cookie_deleted(response)
+    assert_csrf_cookie_deleted(response)
+
+
+@pytest.mark.parametrize("endpoint", ["/auth/refresh", "/auth/logout"])
+async def test_cookie_authenticated_endpoints_require_matching_csrf_token(
+    client: AsyncClient,
+    endpoint: str,
+) -> None:
+    response = await client.post(
+        endpoint,
+        headers={
+            "Cookie": f"{CSRF_COOKIE_NAME}=csrf-token",
+            CSRF_HEADER_NAME: "different-token",
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json() == {"detail": "Could not validate credentials"}
+
+
+async def test_logout_revokes_only_current_device_session(
+    application: FastAPI,
+    client: AsyncClient,
+    test_user: SeededUser,
+    test_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    first_login = await login(client, test_user)
+    first_refresh_token = refresh_token_from(first_login)
+    first_claims = decode_refresh_token(first_refresh_token)
+
+    second_login = await login(client, test_user)
+    second_refresh_token = refresh_token_from(second_login)
+    second_claims = decode_refresh_token(second_refresh_token)
+    csrf_token = csrf_token_from(second_login)
+
+    logout_response = await client.post(
+        "/auth/logout",
+        headers=csrf_headers(
+            csrf_token,
+            refresh_token=first_refresh_token,
+        ),
+    )
+
+    assert logout_response.status_code == 204
+    assert_refresh_cookie_deleted(logout_response)
+    assert_csrf_cookie_deleted(logout_response)
+
+    async with AsyncClient(
+        transport=ASGITransport(app=application),
+        base_url="https://testserver",
+    ) as refresh_client:
+        first_refresh_response = await refresh_client.post(
+            "/auth/refresh",
+            headers=csrf_headers(
+                csrf_token,
+                refresh_token=first_refresh_token,
+            ),
+        )
+        second_refresh_response = await refresh_client.post(
+            "/auth/refresh",
+            headers=csrf_headers(
+                csrf_token,
+                refresh_token=second_refresh_token,
+            ),
+        )
+
+    assert first_refresh_response.status_code == 401
+    assert second_refresh_response.status_code == 200
+
+    async with test_session_factory() as session:
+        first_session = await session.get(AuthSession, first_claims.session_id)
+        second_session = await session.get(AuthSession, second_claims.session_id)
+
+    assert first_session is not None
+    assert first_session.revoked_at is not None
+    assert second_session is not None
+    assert second_session.revoked_at is None

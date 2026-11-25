@@ -1,0 +1,344 @@
+Project rent {
+  database_type: 'PostgreSQL'
+}
+
+table users {
+  id integer [primary key]
+  email varchar [unique, not null]
+  password_hash varchar [not null]
+  first_name varchar
+  last_name varchar
+  default_address_id integer [unique]
+  created_at datetime [not null]
+  last_login_at datetime
+}
+
+table categories {
+  id integer [primary key]
+  name string
+  slug string
+  image varchar
+}
+
+table subcategories {
+  id integer [primary key]
+  name varchar [not null]
+  slug varchar [not null]
+  image varchar
+  category_id integer [not null]
+}
+
+table manufacturers {
+  id integer [primary key]
+  name varchar [not null]
+  slug varchar [not null]
+}
+
+table addresses {
+  id integer [primary key]
+  first_name varchar
+  last_name varchar
+  first_line varchar [not null]
+  second_line varchar
+  postal_code varchar [not null]
+  city varchar [not null]
+  country varchar [not null]
+  company varchar
+  nip varchar
+}
+
+table order_addresses {
+  order_id integer [primary key]
+  first_name varchar
+  last_name varchar
+  first_line varchar [not null]
+  second_line varchar
+  postal_code varchar [not null]
+  city varchar [not null]
+  country varchar [not null]
+  company varchar
+  nip varchar
+}
+
+table orders {
+  id integer [primary key]
+  user_id integer [not null]
+  created_at datetime [not null]
+  status order_status [not null, default: "PENDING"]
+  payment_code uuid
+  used_points bool [default: false]
+  points_to_spend integer [not null, default: 0]
+  promo_code_id integer
+  total_price decimal(12,2) [not null]
+  recipient_first_name varchar [not null]
+  recipient_last_name varchar [not null]
+}
+
+enum payment_status {
+  "PENDING"
+  "SUCCEEDED"
+  "FAILED"
+  "CANCELLED"
+}
+
+table payments {
+  id integer [primary key]
+  order_id integer [unique, not null]
+  provider varchar(50) [not null]
+  provider_payment_id varchar(255) [unique]
+  status payment_status [not null, default: "PENDING"]
+  amount decimal(12,2) [not null]
+  currency varchar(3) [not null, default: "PLN"]
+  redirect_url varchar(2048)
+  created_at datetime [not null]
+  completed_at datetime
+}
+
+enum loyalty_transaction_type {
+  "EARN"
+  "SPEND"
+  "REFUND"
+  "REVERSAL"
+  "ADJUSTMENT"
+}
+
+table loyalty_transactions {
+  id integer [primary key]
+  user_id integer [not null]
+  order_id integer
+  type loyalty_transaction_type [not null]
+  amount integer [not null]
+  description varchar(255)
+  created_at datetime [not null]
+
+  indexes {
+    (order_id, type) [unique]
+    (user_id, created_at, id) [name: 'ix_loyalty_transactions_user_created_at']
+  }
+
+  checks {
+    `(type IN ('EARN', 'REFUND') AND amount > 0) OR (type IN ('SPEND', 'REVERSAL') AND amount < 0) OR (type = 'ADJUSTMENT' AND amount <> 0)`
+  }
+}
+
+enum status {
+  "PENDING"
+  "UNPAID"
+  "PAID"
+  "GIVEN_OUT"
+  "FINISHED"
+  "CANCELLED"
+}
+
+table order_instances {
+  id integer [primary key]
+  order_id integer [not null]
+  instance_id integer [not null]
+  start_date date [not null]
+  end_date date [not null]
+  price decimal [not null]
+
+  checks {
+    `start_date <= end_date`
+    `price > 0`
+  }
+}
+
+table products {
+  id integer [primary key]
+  name varchar [not null]
+  description text
+  price double
+  slug varchar [unique]
+  meta_description varchar
+  visibility_status bool
+  category_id integer
+  subcategory_id integer
+  manufacturer_id integer
+
+  checks {
+    `price > 0`
+  }
+}
+
+table product_images {
+  id integer [primary key]
+  product_id integer [not null]
+  image image
+  alt_text varchar
+  display_order tinyint
+
+  indexes {
+    (product_id, display_order) [unique]
+  }
+}
+
+table product_sizes {
+  id integer [primary key]
+  product_id integer
+  size varchar
+  description text
+
+  indexes {
+    (product_id, size) [unique]
+  }
+}
+
+table product_accessories {
+  product_id integer [not null]
+  accessory_id integer [not null]
+  display_order tinyint [not null, default: 0]
+
+  indexes {
+    (product_id, accessory_id) [pk]
+    (product_id, display_order) [unique]
+  }
+
+  checks {
+    `product_id <> accessory_id`
+    `display_order >= 0`
+  }
+}
+
+table favorites {
+  id integer [primary key]
+  user_id integer [not null]
+  product_slug varchar [not null]
+}
+
+enum instance_status {
+  "AVAILABLE"
+  "MAINTENANCE"
+  "BROKEN"
+  "RETIRED"
+}
+
+table instances {
+  id integer [primary key]
+  product_id integer [not null]
+  status instance_status [default: "AVAILABLE"]
+  size varchar
+}
+
+table cart_items {
+  id integer [primary key]
+  user_id integer [not null]
+  product_id integer [not null]
+  product_size_id integer
+  quantity integer [not null]
+  start_date date [not null]
+  end_date date [not null]
+  created_at datetime [not null]
+
+  indexes {
+    (user_id, product_id, product_size_id, start_date, end_date) [unique, note: 'NULLS NOT DISTINCT']
+  }
+
+  checks {
+    `start_date <= end_date`
+    `quantity > 0`
+  }
+}
+
+enum promo_discount_type {
+  "PERCENTAGE"
+  "FIXED_AMOUNT"
+}
+
+table promo_codes {
+  id integer [primary key]
+  code varchar(100) [unique, not null]
+  discount_type promo_discount_type [not null]
+  discount_value decimal(12,4) [not null]
+  minimum_order_value decimal(12,2)
+  is_active bool [not null, default: true]
+  valid_from datetime
+  valid_until datetime
+  created_at datetime [not null]
+  usage_count integer [not null, default: 0]
+  max_uses integer
+
+  checks {
+    `(discount_type = 'PERCENTAGE' AND discount_value > 0 AND discount_value <= 1) OR (discount_type = 'FIXED_AMOUNT' AND discount_value > 0)`
+    `minimum_order_value IS NULL OR minimum_order_value >= 0`
+    `usage_count >= 0`
+    `max_uses IS NULL OR max_uses > 0`
+    `valid_from IS NULL OR valid_until IS NULL OR valid_from <= valid_until`
+  }
+}
+
+enum loyalty_transaction_type {
+  "EARN"
+  "SPEND"
+  "REFUND"
+  "REVERSAL"
+  "ADJUSTMENT"
+}
+
+table loyalty_transactions {
+  id integer [primary key]
+  user_id integer [not null]
+  order_id integer
+  type loyalty_transaction_type [not null]
+  amount integer [not null]
+  description varchar
+  created_at datetime [not null]
+
+  indexes {
+    (order_id, type) [unique]
+    (user_id, created_at, id) [name: 'ix_loyalty_transactions_user_created_at']
+  }
+
+  checks {
+    `(type IN ('EARN', 'REFUND') AND amount > 0) OR (type IN ('SPEND', 'REVERSAL') AND amount < 0) OR (type = 'ADJUSTMENT' AND amount <> 0)`
+  }
+}
+
+table auth_sessions {
+  id uuid [primary key]
+  user_id integer [not null]
+  current_jti uuid [unique, not null]
+  previous_jti uuid
+  previous_valid_until datetime
+  current_issued_at datetime [not null]
+  expires_at datetime [not null]
+  revoked_at datetime
+  created_at datetime [not null]
+}
+
+table password_reset_tokens {
+  id uuid [primary key]
+  user_id integer [not null]
+  token_hash varchar(64) [unique, not null]
+  expires_at datetime [not null]
+  used_at datetime
+  created_at datetime [not null]
+}
+
+ref: users.id < orders.user_id
+ref: orders.id - order_addresses.order_id
+ref: orders.id < order_instances.order_id
+ref: orders.id - payments.order_id [delete: restrict]
+ref: instances.id < order_instances.instance_id
+ref: products.id < instances.product_id
+ref: users.id < favorites.user_id
+ref: products.slug < favorites.product_slug
+ref: addresses.id - users.default_address_id
+ref: products.id < product_images.product_id
+ref: users.id < loyalty_transactions.user_id
+ref: orders.id < loyalty_transactions.order_id [delete: set null]
+ref: users.id < cart_items.user_id
+ref: products.id < cart_items.product_id
+ref: product_sizes.id < cart_items.product_size_id
+ref: products.id < product_sizes.product_id
+ref: categories.id < subcategories.category_id
+ref: categories.id < products.category_id
+ref: subcategories.id < products.subcategory_id
+ref: manufacturers.id < products.manufacturer_id
+ref: promo_codes.id < orders.promo_code_id
+ref: products.id < product_accessories.product_id
+ref: products.id < product_accessories.accessory_id
+ref: users.id < loyalty_transactions.user_id
+ref: orders.id < loyalty_transactions.order_id
+ref: users.id < auth_sessions.user_id
+ref: users.id < password_reset_tokens.user_id

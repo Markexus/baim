@@ -1,0 +1,3 @@
+export const PLN_SPENT_PER_POINT_EARNED = 10;
+export const POINTS_REQUIRED_PER_PLN = 2;
+export const MAX_POINTS_PAYMENT_SHARE = 0.3;

